@@ -165,19 +165,6 @@ func getFlutterError(_ error: Error) -> FlutterError {
     }
     
     //MARK:  - AppDelegate
-
-    var lastHandledNotificationId: String?
-
-    func isDuplicateNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
-        if let id = userInfo["notification_id"] as? String {
-            if id == lastHandledNotificationId {
-                return true
-            }
-            lastHandledNotificationId = id
-        }
-        return false
-    }
-
     
     public func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [AnyHashable : Any] = [:]) -> Bool {
         if let launchNotification = launchOptions[UIApplication.LaunchOptionsKey.remoteNotification] as? [String: Any] {
@@ -209,9 +196,7 @@ func getFlutterError(_ error: Error) -> FlutterError {
             onResume(userInfo: userInfo)
         } else {
             DispatchQueue.main.async {
-                if !self.isDuplicateNotification(userInfo) {
-                    self.channel.invokeMethod("onMessage", arguments: userInfo)
-                }
+                self.channel.invokeMethod("onMessage", arguments: userInfo)
             }
         }
         
@@ -236,9 +221,7 @@ func getFlutterError(_ error: Error) -> FlutterError {
                 } else {
                     completionHandler([])
                     let userInfo = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
-                    if !self.isDuplicateNotification(userInfo) {
-                        self.channel.invokeMethod("onMessage", arguments: userInfo)
-                    }
+                    self.channel.invokeMethod("onMessage", arguments: userInfo)
                 }
             }
         }
