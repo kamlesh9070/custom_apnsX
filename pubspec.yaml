@@ -4,7 +4,7 @@ version: 0.0.1
 homepage: https://github.com/Money1998/custom_apnsX.git
 
 environment:
-  sdk: '>=3.4.0 <4.0.0'
+  sdk: ">=2.12.0 <3.0.0"
 
 dependencies:
   flutter:
