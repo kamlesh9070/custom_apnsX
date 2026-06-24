@@ -1,268 +1,309 @@
 import Flutter
 import UserNotifications
 
-func getFlutterError(_ error: Error) -> FlutterError {
+private func flutterError(_ error: Error) -> FlutterError {
     let e = error as NSError
-    return FlutterError(code: "Error: \(e.code)", message: e.domain, details: error.localizedDescription)
+    return FlutterError(code: "apns_error_\(e.code)", message: e.localizedDescription, details: e.domain)
 }
 
-@objc public class FlutterApnsPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate {
-    internal init(channel: FlutterMethodChannel) {
+@objc public class FlutterApnsPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate, FlutterSceneLifeCycleDelegate {
+
+    private let channel: FlutterMethodChannel
+    private var launchNotification: [String: Any]?
+    private var resumingFromBackground = false
+
+    init(channel: FlutterMethodChannel) {
         self.channel = channel
+        super.init()
     }
-    
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_apns", binaryMessenger: registrar.messenger())
         let instance = FlutterApnsPlugin(channel: channel)
         registrar.addApplicationDelegate(instance)
+        registrar.addSceneDelegate(instance)  
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
-    
-    let channel: FlutterMethodChannel
-    var launchNotification: [String: Any]?
-    var resumingFromBackground = false
-    
+
+    // MARK: - Channel helpers
+
+    private func invoke(_ method: String, _ arguments: Any?, result: FlutterResult? = nil) {
+        if Thread.isMainThread {
+            channel.invokeMethod(method, arguments: arguments, result: result)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.channel.invokeMethod(method, arguments: arguments, result: result)
+            }
+        }
+    }
+
+    // MARK: - Method channel
+
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "requestNotificationPermissions":
             requestNotificationPermissions(call, result: result)
-        case "configure":
-            assert(
-                UNUserNotificationCenter.current().delegate != nil,
-                "UNUserNotificationCenter.current().delegate is not set. Check readme at https://pub.dev/packages/flutter_apns."
-            )
-            UIApplication.shared.registerForRemoteNotifications()
 
-            // check for onLaunch notification *after* configure has been ran
-            if let launchNotification = launchNotification {
-                DispatchQueue.main.async {
-                    self.channel.invokeMethod("onLaunch", arguments: launchNotification)
-                }
-                self.launchNotification = nil
+        case "configure":
+            guard UNUserNotificationCenter.current().delegate != nil else {
+                result(FlutterError(
+                    code: "delegate_not_set",
+                    message: "UNUserNotificationCenter.current().delegate is nil. Assign it in AppDelegate before calling configure(). See https://pub.dev/packages/flutter_apns",
+                    details: nil
+                ))
                 return
             }
+            UIApplication.shared.registerForRemoteNotifications()
+            if let launch = launchNotification {
+                launchNotification = nil
+                invoke("onLaunch", launch)
+            }
             result(nil)
+
         case "getAuthorizationStatus":
             getAuthorizationStatus(result)
+
         case "unregister":
             UIApplication.shared.unregisterForRemoteNotifications()
             result(nil)
+
         case "setNotificationCategories":
-            setNotificationCategories(arguments: call.arguments!)
-            result(nil)
+            do {
+                try setNotificationCategories(call.arguments)
+                result(nil)
+            } catch {
+                result(FlutterError(code: "invalid_categories", message: "\(error)", details: nil))
+            }
+
         default:
-            assertionFailure(call.method)
             result(FlutterMethodNotImplemented)
         }
     }
 
-    func setNotificationCategories(arguments: Any) {
-        let arguments = arguments as! [[String: Any]]
-        func decodeCategory(map: [String: Any]) -> UNNotificationCategory {
-            return UNNotificationCategory(
-                identifier: map["identifier"] as! String,
-                actions: (map["actions"] as! [[String: Any]]).map(decodeAction),
-                intentIdentifiers: map["intentIdentifiers"] as! [String],
-                options: decodeCategoryOptions(data: map["options"] as! [String])
-            )
-        }
-        func decodeCategoryOptions(data: [String]) -> UNNotificationCategoryOptions {
-            let mapped = data.compactMap {
-                UNNotificationCategoryOptions.stringToValue[$0]
-            }
-            return .init(mapped)
-        }
+    // MARK: - Categories (safe decoding, no force casts)
 
-        func decodeAction(map: [String: Any]) -> UNNotificationAction {
-            return UNNotificationAction(
-                identifier: map["identifier"] as! String,
-                title: map["title"] as! String,
-                options: decodeActionOptions(data: map["options"] as! [String])
-            )
-        }
+    private enum DecodeError: Error { case malformed(String) }
 
-        func decodeActionOptions(data: [String]) -> UNNotificationActionOptions {
-            let mapped = data.compactMap {
-                UNNotificationActionOptions.stringToValue[$0]
-            }
-            return .init(mapped)
+    private func setNotificationCategories(_ arguments: Any?) throws {
+        guard let raw = arguments as? [[String: Any]] else {
+            throw DecodeError.malformed("expected [[String: Any]], got \(String(describing: arguments))")
         }
-
-        let categories = arguments.map(decodeCategory)
+        let categories = try raw.map(decodeCategory)
         UNUserNotificationCenter.current().setNotificationCategories(Set(categories))
     }
 
-    func getAuthorizationStatus(_ result: @escaping FlutterResult) {
-        UNUserNotificationCenter.current().getNotificationSettings { (settings) in
+    private func decodeCategory(_ map: [String: Any]) throws -> UNNotificationCategory {
+        guard let id = map["identifier"] as? String,
+              let actionMaps = map["actions"] as? [[String: Any]],
+              let intents = map["intentIdentifiers"] as? [String],
+              let optionStrings = map["options"] as? [String]
+        else { throw DecodeError.malformed("category: \(map)") }
+
+        return UNNotificationCategory(
+            identifier: id,
+            actions: try actionMaps.map(decodeAction),
+            intentIdentifiers: intents,
+            options: UNNotificationCategoryOptions(
+                optionStrings.compactMap { UNNotificationCategoryOptions.stringToValue[$0] }
+            )
+        )
+    }
+
+    private func decodeAction(_ map: [String: Any]) throws -> UNNotificationAction {
+        guard let id = map["identifier"] as? String,
+              let title = map["title"] as? String,
+              let optionStrings = map["options"] as? [String]
+        else { throw DecodeError.malformed("action: \(map)") }
+
+        return UNNotificationAction(
+            identifier: id,
+            title: title,
+            options: UNNotificationActionOptions(
+                optionStrings.compactMap { UNNotificationActionOptions.stringToValue[$0] }
+            )
+        )
+    }
+
+    // MARK: - Authorization
+
+    private func getAuthorizationStatus(_ result: @escaping FlutterResult) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
             switch settings.authorizationStatus {
-            case .authorized:
-                result("authorized")
-            case .denied:
-                result("denied")
-            case .notDetermined:
-                result("notDetermined")
-            default:
-                result("unsupported")
+            case .authorized:    result("authorized")
+            case .denied:        result("denied")
+            case .notDetermined: result("notDetermined")
+            default:             result("unsupported")
             }
         }
     }
-    
-    func requestNotificationPermissions(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        let center = UNUserNotificationCenter.current()
-        let application = UIApplication.shared
-        
-        func readBool(_ key: String) -> Bool {
-            (call.arguments as? [String: Any])?[key] as? Bool ?? false
-        }
-        
-        assert(center.delegate != nil)
-        
-        var options = [UNAuthorizationOptions]()
-        
-        if readBool("sound") {
-            options.append(.sound)
-        }
-        if readBool("badge") {
-            options.append(.badge)
-        }
-        if readBool("alert") {
-            options.append(.alert)
-        }
-        
-        var provisionalRequested = false
-        if #available(iOS 12.0, *) {
-            if readBool("provisional") {
-                options.append(.provisional)
-                provisionalRequested = true
-            }
-        }
 
-        
-        let optionsUnion = UNAuthorizationOptions(options)
-        
-        center.requestAuthorization(options: optionsUnion) { (granted, error) in
-            if let error = error {
-                result(getFlutterError(error))
+    private func requestNotificationPermissions(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        let center = UNUserNotificationCenter.current()
+        let args = call.arguments as? [String: Any] ?? [:]
+        func flag(_ key: String) -> Bool { args[key] as? Bool ?? false }
+
+        var options: UNAuthorizationOptions = []
+        if flag("sound") { options.insert(.sound) }
+        if flag("badge") { options.insert(.badge) }
+        if flag("alert") { options.insert(.alert) }
+        let provisionalRequested = flag("provisional")
+        if provisionalRequested { options.insert(.provisional) }
+
+        center.requestAuthorization(options: options) { [weak self] granted, error in
+            guard let self else { return }
+            if let error {
+                result(flutterError(error))
                 return
             }
-            
-            center.getNotificationSettings { (settings) in
-                let map = [
+            center.getNotificationSettings { settings in
+                let map: [String: Bool] = [
                     "sound": settings.soundSetting == .enabled,
                     "badge": settings.badgeSetting == .enabled,
                     "alert": settings.alertSetting == .enabled,
-                    "provisional": granted && provisionalRequested
+                    "provisional": granted && provisionalRequested,
                 ]
-                DispatchQueue.main.async {
-                    self.channel.invokeMethod("onIosSettingsRegistered", arguments: map)
-                }
+                self.invoke("onIosSettingsRegistered", map)
             }
-            
+            // registerForRemoteNotifications must run on the main thread.
+            DispatchQueue.main.async {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
             result(granted)
         }
-        
-        application.registerForRemoteNotifications()
     }
-    
-    //MARK:  - AppDelegate
-    
-    public func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [AnyHashable : Any] = [:]) -> Bool {
-        if let launchNotification = launchOptions[UIApplication.LaunchOptionsKey.remoteNotification] as? [String: Any] {
-            self.launchNotification = FlutterApnsSerialization.remoteMessageUserInfo(toDict: launchNotification)
+
+    // Cold start: launchOptions is nil under UIScene, so the notification that
+    // launched the app arrives here instead of in didFinishLaunching.
+    public func scene(_ scene: UIScene,
+                  willConnectTo session: UISceneSession,
+                  options connectionOptions: UIScene.ConnectionOptions?) -> Bool {
+    if let userInfo = connectionOptions?.notificationResponse?.notification.request.content.userInfo,
+       userInfo["aps"] != nil {
+        launchNotification = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
+    }
+    return false   //  observer only — let the chain continue to other plugins
+}
+
+
+    // MARK: - UISceneDelegate (replaces the application* equivalents post-migration)
+
+    public func sceneDidEnterBackground(_ scene: UIScene) {
+        resumingFromBackground = true               // mirrors applicationDidEnterBackground
+    }
+
+    public func sceneDidBecomeActive(_ scene: UIScene) {
+        resumingFromBackground = false
+        clearBadge()                                // mirrors applicationDidBecomeActive
+    }
+
+    // MARK: - UIApplicationDelegate
+
+    public func application(_ application: UIApplication,
+                            didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any] = [:]) -> Bool {
+        if let remote = launchOptions[.remoteNotification] as? [String: Any] {
+            launchNotification = FlutterApnsSerialization.remoteMessageUserInfo(toDict: remote)
         }
         return true
     }
-    
+
     public func applicationDidEnterBackground(_ application: UIApplication) {
         resumingFromBackground = true
     }
-    
+
     public func applicationDidBecomeActive(_ application: UIApplication) {
         resumingFromBackground = false
-        UIApplication.shared.applicationIconBadgeNumber = -1;
+        clearBadge()
     }
-    
-    public func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        DispatchQueue.main.async {
-            self.channel.invokeMethod("onToken", arguments: deviceToken.hexString)
-        }
-    }
-    
-    
-    public func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable : Any], fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) -> Bool {
-        let userInfo = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
-        
-        if resumingFromBackground {
-            onResume(userInfo: userInfo)
+
+    private func clearBadge() {
+        if #available(iOS 16.0, *) {
+            UNUserNotificationCenter.current().setBadgeCount(0)
         } else {
-            DispatchQueue.main.async {
-                self.channel.invokeMethod("onMessage", arguments: userInfo)
-            }
+            UIApplication.shared.applicationIconBadgeNumber = 0
         }
-        
+    }
+
+    public func application(_ application: UIApplication,
+                            didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        invoke("onToken", deviceToken.hexString)
+    }
+
+    public func application(_ application: UIApplication,
+                            didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        invoke("onTokenError", error.localizedDescription)
+    }
+
+    public func application(_ application: UIApplication,
+                            didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                            fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) -> Bool {
+        let dict = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
+        invoke(resumingFromBackground ? "onResume" : "onMessage", dict)
         completionHandler(.noData)
         return true
     }
-    
-    public func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    private static var foregroundPresentationOptions: UNNotificationPresentationOptions {
+        if #available(iOS 14.0, *) {
+            return [.banner, .list, .badge, .sound]
+        } else {
+            return [.alert, .badge, .sound]
+        }
+    }
+
+    public func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                       willPresent notification: UNNotification,
+                                       withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let userInfo = notification.request.content.userInfo
-        
         guard userInfo["aps"] != nil else {
+            completionHandler([])   // always call the handler
             return
         }
-        
         let dict = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
-        
-        DispatchQueue.main.async {
-            self.channel.invokeMethod("willPresent", arguments: dict) { (result) in
-                let shouldShow = (result as? Bool) ?? false
-                if shouldShow {
-                    completionHandler([.alert, .sound])
-                } else {
-                    completionHandler([])
-                    let userInfo = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
-                    self.channel.invokeMethod("onMessage", arguments: userInfo)
-                }
+        invoke("willPresent", dict) { [weak self] response in
+            let shouldShow = (response as? Bool) ?? false
+            if shouldShow {
+                completionHandler(Self.foregroundPresentationOptions)
+            } else {
+                completionHandler([])
+                self?.invoke("onMessage", dict)
             }
         }
     }
-    
-    public func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+
+    public func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                       didReceive response: UNNotificationResponse,
+                                       withCompletionHandler completionHandler: @escaping () -> Void) {
         var userInfo = response.notification.request.content.userInfo
         guard userInfo["aps"] != nil else {
+            completionHandler()     // always call the handler
             return
         }
-        
         userInfo["actionIdentifier"] = response.actionIdentifier
         let dict = FlutterApnsSerialization.remoteMessageUserInfo(toDict: userInfo)
-        
+
+        // Cold start via notification tap: defer to configure() -> onLaunch.
         if launchNotification != nil {
             launchNotification = dict
+            completionHandler()
             return
         }
-
-        onResume(userInfo: dict)
+        invoke("onResume", dict)
         completionHandler()
-    }
-    
-    func onResume(userInfo: [AnyHashable: Any]) {
-        DispatchQueue.main.async {
-            self.channel.invokeMethod("onResume", arguments: userInfo)
-        }
     }
 }
 
+// MARK: - Option string maps
+
 extension UNNotificationCategoryOptions {
     static let stringToValue: [String: UNNotificationCategoryOptions] = {
-        var r: [String: UNNotificationCategoryOptions] = [:]
-        r["UNNotificationCategoryOptions.customDismissAction"] = .customDismissAction
-        r["UNNotificationCategoryOptions.allowInCarPlay"] = .allowInCarPlay
-        if #available(iOS 11.0, *) {
-            r["UNNotificationCategoryOptions.hiddenPreviewsShowTitle"] = .hiddenPreviewsShowTitle
-        }
-        if #available(iOS 11.0, *) {
-            r["UNNotificationCategoryOptions.hiddenPreviewsShowSubtitle"] = .hiddenPreviewsShowSubtitle
-        }
+        var r: [String: UNNotificationCategoryOptions] = [
+            "UNNotificationCategoryOptions.customDismissAction": .customDismissAction,
+            "UNNotificationCategoryOptions.allowInCarPlay": .allowInCarPlay,
+            "UNNotificationCategoryOptions.hiddenPreviewsShowTitle": .hiddenPreviewsShowTitle,
+            "UNNotificationCategoryOptions.hiddenPreviewsShowSubtitle": .hiddenPreviewsShowSubtitle,
+        ]
         if #available(iOS 13.0, *) {
             r["UNNotificationCategoryOptions.allowAnnouncement"] = .allowAnnouncement
         }
@@ -271,18 +312,15 @@ extension UNNotificationCategoryOptions {
 }
 
 extension UNNotificationActionOptions {
-    static let stringToValue: [String: UNNotificationActionOptions] = {
-        var r: [String: UNNotificationActionOptions] = [:]
-        r["UNNotificationActionOptions.authenticationRequired"] = .authenticationRequired
-        r["UNNotificationActionOptions.destructive"] = .destructive
-        r["UNNotificationActionOptions.foreground"] = .foreground
-        return r
-    }()
+    static let stringToValue: [String: UNNotificationActionOptions] = [
+        "UNNotificationActionOptions.authenticationRequired": .authenticationRequired,
+        "UNNotificationActionOptions.destructive": .destructive,
+        "UNNotificationActionOptions.foreground": .foreground,
+    ]
 }
 
 extension Data {
     var hexString: String {
-        let hexString = map { String(format: "%02.2hhx", $0) }.joined()
-        return hexString
+        map { String(format: "%02.2hhx", $0) }.joined()
     }
 }
